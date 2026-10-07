@@ -1,25 +1,19 @@
 FROM python:3.12-slim
 
-# Install dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    git \
+RUN apt-get update && apt-get install -y curl git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenCode CLI
-RUN curl -fsSL https://opencode.ai/install | bash
-
-# Set working directory
 WORKDIR /app
 
-# Copy requirements and install Python deps
+# Clone zen-proxy (single file, no npm install)
+RUN git clone https://github.com/12errh/zen-proxy.git /opt/zen-proxy
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
 COPY . .
 
-# Start both OpenCode server and the bot
-CMD ["sh", "-c", "opencode serve --port 4096 & python bot.py"]
+# Start proxy in background, then bot
+CMD sh -c "node /opt/zen-proxy/zen-proxy.mjs & sleep 3 && python bot.py"
