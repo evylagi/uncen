@@ -3,21 +3,42 @@ import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 from config import TELEGRAM_BOT_TOKEN, DEFAULT_MODEL
 from zen_client import client
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("tg-bot")
 
-# Per-user state
+# ── Per-user state ────────────────────────────────────────────────
 user_models: dict[int, str] = {}
-user_history: dict[int, list[dict]] = {}  # simple conversation history
+user_history: dict[int, list[dict]] = {}
+user_files: dict[int, dict] = {}  # {uid: {"name": str, "content": str}}
 
 _models_cache: dict = {"data": [], "ts": 0.0}
 CACHE_TTL = 300
 
+CODE_EXTS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".go", ".rs", ".rb", ".php", ".sh", ".bash", ".zsh", ".fish",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".json", ".xml", ".html",
+    ".css", ".scss", ".sql", ".md", ".txt", ".log", ".env", ".gitignore",
+}
+
+MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_HISTORY = 20
+
+
+# ── Helpers ───────────────────────────────────────────────────────
 
 async def get_free_models() -> list[str]:
     now = time.time()
@@ -38,6 +59,15 @@ def get_history(uid: int) -> list[dict]:
     return user_history.setdefault(uid, [])
 
 
+def get_file(uid: int) -> dict | None:
+    return user_files.get(uid)
+
+
+def reset_user(uid: int):
+    user_history[uid] = []
+    user_files.pop(uid, None)
+
+
 # ── Commands ──────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -45,33 +75,89 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = "✅ Zen proxy reachable" if ok else "⚠️ Zen proxy not reachable"
     await update.message.reply_text(
         f"OpenCode Zen bot online.\n{status}\n\n"
+        "/new — fresh conversation\n"
+        "/compact — compress context\n"
+        "/undo — remove last exchange\n"
         "/models — pick a free model\n"
-        "/clear — reset conversation\n"
-        "/status — health\n"
-        "/help — commands"
+        "/clearfile — remove attached file\n"
+        "/status — health & current state\n"
+        "/init — AGENTS.md info\n"
+        "/help — all commands\n\n"
+        "Send text as a prompt, or a .txt/.py file to attach it."
     )
 
 
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/start — welcome\n/help — this message\n"
-        "/models — free Zen models\n/clear — reset chat history\n"
-        "/status — health\n\nSend any text as a prompt."
+        "*OpenCode Zen Bot*\n\n"
+        "*Conversation*\n"
+        "/new — fresh conversation\n"
+        "/compact — compress context\n"
+        "/clear — alias for /new\n"
+        "/undo — remove last exchange\n"
+        "/redo — not supported via proxy\n\n"
+        "*Model*\n"
+        "/models — browse free Zen models\n"
+        "/status — health & current state\n\n"
+        "*Files*\n"
+        "Send a .txt or code file to attach it\n"
+        "/clearfile — remove current attachment\n\n"
+        "*Project*\n"
+        "/init — AGENTS.md info\n\n"
+        "Send any text as a prompt.",
+        parse_mode="Markdown",
     )
 
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ok = await client.health()
     uid = update.effective_user.id
+    history = get_history(uid)
+    f = get_file(uid)
+    file_info = f"`{f['name']}`" if f else "none"
     await update.message.reply_text(
-        f"Zen proxy: {'up' if ok else 'down'}\nModel: `{get_model(uid)}`",
+        f"Zen proxy: {'up' if ok else 'down'}\n"
+        f"Model: `{get_model(uid)}`\n"
+        f"Messages: {len(history)}\n"
+        f"Attached: {file_info}",
         parse_mode="Markdown",
     )
 
 
+async def new_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    reset_user(update.effective_user.id)
+    await update.message.reply_text("Started a fresh conversation.")
+
+
+async def compact(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    reset_user(update.effective_user.id)
+    await update.message.reply_text("Context compacted.")
+
+
 async def clear_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_history[update.effective_user.id] = []
+    reset_user(update.effective_user.id)
     await update.message.reply_text("Conversation cleared.")
+
+
+async def undo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    history = get_history(uid)
+    if len(history) >= 2:
+        user_history[uid] = history[:-2]
+        await update.message.reply_text("Removed last exchange.")
+    else:
+        await update.message.reply_text("Nothing to undo.")
+
+
+async def redo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Redo not supported via proxy.")
+
+
+async def init_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "To initialize an AGENTS.md file, create it manually in your project root.\n"
+        "OpenCode reads it automatically for project-specific instructions."
+    )
 
 
 async def models_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -102,6 +188,70 @@ async def model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"Model set to `{model}`", parse_mode="Markdown")
 
 
+async def clear_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid in user_files:
+        name = user_files[uid]["name"]
+        del user_files[uid]
+        await update.message.reply_text(f"Removed `{name}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("No file attached.")
+
+
+# ── File handler ──────────────────────────────────────────────────
+
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    doc = update.message.document
+    if not doc:
+        return
+
+    fname = doc.file_name or "unnamed"
+    ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+
+    if ext not in CODE_EXTS:
+        await update.message.reply_text(
+            f"Unsupported file type: `{ext}`\n"
+            f"Supported: .txt and common code files.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if doc.file_size and doc.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text("File too large (Telegram limit: 20MB).")
+        return
+
+    try:
+        tg_file = await doc.get_file()
+        raw = await tg_file.download_as_bytearray()
+    except Exception as e:
+        await update.message.reply_text(f"Download failed: {e}")
+        return
+
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            content = raw.decode("latin-1")
+        except Exception:
+            await update.message.reply_text("Could not decode file as text.")
+            return
+
+    user_files[uid] = {"name": fname, "content": content}
+
+    lines = content.splitlines()
+    preview = "\n".join(lines[:15])
+    if len(lines) > 15:
+        preview += f"\n... ({len(lines) - 15} more lines)"
+
+    await update.message.reply_text(
+        f"📎 Attached: `{fname}` ({len(lines)} lines, {len(content)} chars)\n\n"
+        f"```\n{preview[:1500]}\n```\n\n"
+        f"Send a prompt to analyze it. Content is prepended to your next message.",
+        parse_mode="Markdown",
+    )
+
+
 # ── Message handler ───────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -110,11 +260,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    f = get_file(uid)
+    if f:
+        effective = f"```{f['name']}\n{f['content']}\n```\n\n{text}"
+    else:
+        effective = text
+
     model = get_model(uid)
     history = get_history(uid)
-    history.append({"role": "user", "content": text})
-    # Keep last 20 messages to bound context
-    history = history[-20:]
+    history.append({"role": "user", "content": effective})
+    history = history[-MAX_HISTORY:]
 
     msg = await update.message.reply_text(
         f"⏳ thinking… (`{model}`)",
@@ -168,15 +323,31 @@ async def on_shutdown(app: Application):
     await client.close()
 
 
+# ── Entrypoint ────────────────────────────────────────────────────
+
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_shutdown(on_shutdown).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("new", new_session))
+    app.add_handler(CommandHandler("compact", compact))
     app.add_handler(CommandHandler("clear", clear_history))
+    app.add_handler(CommandHandler("undo", undo))
+    app.add_handler(CommandHandler("redo", redo))
+    app.add_handler(CommandHandler("init", init_agents))
     app.add_handler(CommandHandler("models", models_command))
+    app.add_handler(CommandHandler("clearfile", clear_file))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     log.info("Bot starting…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
