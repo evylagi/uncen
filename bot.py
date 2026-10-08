@@ -23,7 +23,7 @@ log = logging.getLogger("tg-bot")
 # ── Per-user state ────────────────────────────────────────────────
 user_models: dict[int, str] = {}
 user_history: dict[int, list[dict]] = {}
-user_files: dict[int, dict] = {}  # {uid: {"name": str, "content": str}}
+user_files: dict[int, dict] = {}
 
 _models_cache: dict = {"data": [], "ts": 0.0}
 CACHE_TTL = 300
@@ -39,7 +39,7 @@ CODE_EXTS = {
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_HISTORY = 20
-STREAM_TIMEOUT = 120  # seconds
+STREAM_TIMEOUT = 120
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -78,6 +78,22 @@ def get_file(uid: int) -> dict | None:
 def reset_user(uid: int):
     user_history[uid] = []
     user_files.pop(uid, None)
+
+
+async def keep_typing(chat, stop_event: asyncio.Event):
+    """Refresh the typing indicator every 4s until stopped."""
+    try:
+        while not stop_event.is_set():
+            try:
+                await chat.send_action(ChatAction.TYPING)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                continue
+    except asyncio.CancelledError:
+        pass
 
 
 # ── Commands ──────────────────────────────────────────────────────
@@ -217,7 +233,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fname = doc.file_name or "unnamed"
     ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
 
-    # Extension filter restored
     if ext not in CODE_EXTS:
         await update.message.reply_text(
             f"Unsupported file type: `{ext}`\n"
@@ -262,7 +277,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📎 Attached: `{fname}` ({len(lines)} lines, {len(content)} chars)\n\n"
         f"```\n{preview[:1500]}\n```\n\n"
-        f"Send a prompt to analyze it. Content is prepended to your next message.",
+        f"Send a prompt to analyze it.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -283,20 +298,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     model = get_model(uid)
     short_model = model.split("/", 1)[-1]
+
+    # Mutate the stored history in place, not the local reference
     history = get_history(uid)
     history.append({"role": "user", "content": effective})
-    history = history[-MAX_HISTORY:]
+    if len(history) > MAX_HISTORY:
+        del history[:-MAX_HISTORY]
 
     msg = await update.message.reply_text(
         f"⏳ thinking… (`{short_model}`)",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await update.message.chat.send_action(ChatAction.TYPING)
 
     thinking_text = ""
     answer_text = ""
     last_edit = 0.0
+    last_body = ""
     got_anything = False
+    error_text = ""
 
     def render() -> str:
         parts = []
@@ -309,11 +328,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parts.append(esc(answer_text))
         return "\n\n".join(parts)[:4000]
 
+    # Typing indicator that refreshes itself
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(keep_typing(update.message.chat, stop_typing))
+
     try:
-        # Wrap the stream in a timeout so it can't hang forever
         async def _stream():
-            nonlocal thinking_text, answer_text, last_edit, got_anything
+            nonlocal thinking_text, answer_text, last_edit, last_body, got_anything, error_text
             async for chunk in client.stream_chat(history, model):
+                # Surface stream-level errors (429, 401, etc.)
+                if isinstance(chunk, dict) and chunk.get("error"):
+                    err = chunk["error"]
+                    if isinstance(err, dict):
+                        error_text = err.get("message", str(err))
+                    else:
+                        error_text = str(err)
+                    return
+
                 choice = chunk.get("choices", [{}])[0]
                 delta = choice.get("delta", {})
 
@@ -337,9 +368,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 now = time.time()
                 if now - last_edit > 1.2:
                     body = render()
-                    if body:
+                    if body and body != last_body:
                         try:
                             await msg.edit_text(body, parse_mode=ParseMode.HTML)
+                            last_body = body
                             last_edit = now
                         except Exception:
                             pass
@@ -347,18 +379,33 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.wait_for(_stream(), timeout=STREAM_TIMEOUT)
 
     except asyncio.TimeoutError:
+        stop_typing.set()
+        typing_task.cancel()
         await msg.edit_text(
-            f"❌ Timed out after {STREAM_TIMEOUT}s. Check the Zen proxy is running."
+            f"❌ Timed out after {STREAM_TIMEOUT}s. The proxy may be down or the model is rate-limited."
         )
         return
     except Exception as e:
+        stop_typing.set()
+        typing_task.cancel()
         log.exception("stream error")
         await msg.edit_text(f"❌ Error: {e}")
+        return
+    finally:
+        stop_typing.set()
+        typing_task.cancel()
+
+    # ── Final render ─────────────────────────────────────────────
+    if error_text:
+        await msg.edit_text(f"❌ Model error: {error_text}")
         return
 
     if got_anything:
         history.append({"role": "assistant", "content": answer_text or thinking_text})
         body = render()
+        if not body:
+            await msg.edit_text("(empty response)")
+            return
         for i in range(0, len(body), 4000):
             chunk = body[i:i + 4000]
             if i == 0:
@@ -369,7 +416,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(chunk)
     else:
-        await msg.edit_text("(no response — model returned empty)")
+        await msg.edit_text(
+            "⚠️ No response from model.\n"
+            "This usually means the free daily quota for this model is exhausted.\n"
+            "Try `/models` to switch to another free model.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 async def on_shutdown(app: Application):
