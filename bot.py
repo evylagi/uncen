@@ -48,6 +48,9 @@ MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_HISTORY = 20
 STREAM_TIMEOUT = 120
 
+SYSTEM_TAG_OPEN = "[[SYSTEM]]"
+SYSTEM_TAG_CLOSE = "[[/SYSTEM]]"
+
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -88,7 +91,6 @@ def reset_user(uid: int):
 
 
 async def keep_typing(chat, stop_event: asyncio.Event):
-    """Refresh the typing indicator every 4s until stopped."""
     try:
         while not stop_event.is_set():
             try:
@@ -114,7 +116,6 @@ def behaviors_file_exists() -> bool:
 
 
 def read_behaviors() -> str | None:
-    """Read behaviors.txt fresh each time — edits take effect immediately."""
     if not behaviors_enabled():
         return None
     if not behaviors_file_exists():
@@ -126,12 +127,77 @@ def read_behaviors() -> str | None:
         return None
 
 
+def _wrap_prelude(behaviors: str, user_content: str) -> str:
+    return (
+        SYSTEM_TAG_OPEN + "\n"
+        + behaviors + "\n"
+        + SYSTEM_TAG_CLOSE + "\n\n"
+        + user_content
+    )
+
+
 def build_payload(history: list[dict]) -> list[dict]:
-    """Prepend system prompt from behaviors.txt if enabled."""
+    """
+    Dual injection — system role + prelude tag on a user turn.
+
+    The prelude is tagged on the FIRST user turn if untagged. If the first
+    user turn has already been truncated out of history (or was never the
+    tagged one), the CURRENT user turn gets the tag instead. Guarantees
+    exactly one prelude per request, regardless of history length.
+    """
     b = read_behaviors()
     if not b:
         return list(history)
-    return [{"role": "system", "content": b}, *history]
+
+    if not history:
+        return [{"role": "system", "content": b}]
+
+    # Copy so we don't mutate the caller's history
+    working = [dict(m) for m in history]
+
+    # Find the current (last) user message and check if any user message
+    # in history already carries the prelude tag.
+    already_tagged = any(
+        m.get("role") == "user" and SYSTEM_TAG_OPEN in m.get("content", "")
+        for m in working
+    )
+
+    if not already_tagged:
+        # Tag the current user turn — survives truncation, always present.
+        for m in reversed(working):
+            if m.get("role") == "user":
+                m["content"] = _wrap_prelude(b, m.get("content", ""))
+                break
+
+    return [{"role": "system", "content": b}, *working]
+
+
+# ── Wrapper voice (placeholder only) ──────────────────────────────
+
+def v_thinking(short_model: str) -> str:
+    if behaviors_enabled():
+        return f"`P mode · {short_model}`"
+    return f"⏳ thinking… (`{short_model}`)"
+
+
+def v_timeout() -> str:
+    return f"❌ Timed out after {STREAM_TIMEOUT}s. The proxy may be down or the model is rate-limited."
+
+
+def v_error(e: Exception) -> str:
+    return f"❌ Error: {e}"
+
+
+def v_model_error(msg: str) -> str:
+    return f"❌ Model error: {msg}"
+
+
+def v_empty() -> str:
+    return (
+        "⚠️ No response from model.\n"
+        "This usually means the free daily quota for this model is exhausted.\n"
+        "Try `/models` to switch to another free model."
+    )
 
 
 # ── Commands ──────────────────────────────────────────────────────
@@ -148,6 +214,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/clearfile — remove attached file\n"
         "/behaviors — manage system instructions\n"
         "/status — health & current state\n"
+        "/debug — dump current payload\n"
         "/help — all commands\n\n"
         "Send text as a prompt, or attach a code/text file."
     )
@@ -173,6 +240,8 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/behaviors off — disable\n"
         "/behaviors show — dump current file\n"
         "/behaviors reload — re-check file\n\n"
+        "*Debug*\n"
+        "/debug — dump exact payload sent to zen\n\n"
         "Send any text as a prompt.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -295,8 +364,8 @@ async def behaviors_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "`/behaviors on` — enable\n"
             "`/behaviors off` — disable\n"
             "`/behaviors show` — dump current file\n"
-            "`/behaviors reload` — re-check file\n\n"
-            "Edit `behaviors.txt` and changes apply on next request — no restart needed.",
+            "`/behaviors reload` — re-check file\n"
+            "`/debug` — dump payload sent to zen",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -309,7 +378,9 @@ async def behaviors_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         _behaviors_state["enabled"] = True
-        await update.message.reply_text("Behaviors ON.")
+        await update.message.reply_text(
+            "Behaviors ON. System prompt + prelude injection active."
+        )
         return
 
     if sub == "off":
@@ -329,9 +400,7 @@ async def behaviors_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sub == "show":
         b = read_behaviors()
         if b is None:
-            await update.message.reply_text(
-                "Behaviors are OFF or file missing."
-            )
+            await update.message.reply_text("Behaviors are OFF or file missing.")
             return
         chunks = [b[i:i + 3500] for i in range(0, len(b), 3500)]
         for i, chunk in enumerate(chunks):
@@ -348,9 +417,33 @@ async def behaviors_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/behaviors off` — disable\n"
         "`/behaviors show` — dump current file\n"
         "`/behaviors reload` — re-check\n"
-        "`/behaviors` — status",
+        "`/behaviors` — status\n"
+        "`/debug` — dump payload",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def debug_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    history = get_history(uid)
+    payload = build_payload(history)
+
+    lines = [f"Payload — {len(payload)} message(s)"]
+    for i, m in enumerate(payload):
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        head = content[:240].replace("\n", "⏎")
+        tail = "…" if len(content) > 240 else ""
+        lines.append(f"[{i}] {role} ({len(content)} chars)\n    {head}{tail}")
+
+    body = "\n\n".join(lines)
+    chunks = [body[i:i + 3500] for i in range(0, len(body), 3500)]
+    for i, chunk in enumerate(chunks):
+        header = f"*debug* ({i + 1}/{len(chunks)})\n\n" if len(chunks) > 1 else "*debug*\n\n"
+        await update.message.reply_text(
+            header + f"```\n{chunk}\n```",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 # ── File handler ──────────────────────────────────────────────────
@@ -436,7 +529,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         del history[:-MAX_HISTORY]
 
     msg = await update.message.reply_text(
-        f"⏳ thinking… (`{short_model}`)",
+        v_thinking(short_model),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -465,6 +558,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async def _stream():
             nonlocal thinking_text, answer_text, last_edit, last_body, got_anything, error_text
             payload = build_payload(history)
+            log.info(
+                "payload: %d msgs, roles=%s, first_user_tagged=%s",
+                len(payload),
+                [m.get("role") for m in payload],
+                any(SYSTEM_TAG_OPEN in (m.get("content") or "")
+                    for m in payload if m.get("role") == "user"),
+            )
             async for chunk in client.stream_chat(payload, model):
                 if isinstance(chunk, dict) and chunk.get("error"):
                     err = chunk["error"]
@@ -510,25 +610,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except asyncio.TimeoutError:
         stop_typing.set()
         typing_task.cancel()
-        await msg.edit_text(
-            f"❌ Timed out after {STREAM_TIMEOUT}s. The proxy may be down or the model is rate-limited."
-        )
+        await msg.edit_text(v_timeout())
         return
     except Exception as e:
         stop_typing.set()
         typing_task.cancel()
         log.exception("stream error")
-        await msg.edit_text(f"❌ Error: {e}")
+        await msg.edit_text(v_error(e))
         return
     finally:
         stop_typing.set()
         typing_task.cancel()
 
     if error_text:
-        await msg.edit_text(f"❌ Model error: {error_text}")
+        await msg.edit_text(v_model_error(error_text))
         return
 
     if got_anything:
+        # Store the raw assistant answer (without tag pollution) in history
         history.append({"role": "assistant", "content": answer_text or thinking_text})
         body = render()
         if not body:
@@ -544,12 +643,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(chunk)
     else:
-        await msg.edit_text(
-            "⚠️ No response from model.\n"
-            "This usually means the free daily quota for this model is exhausted.\n"
-            "Try `/models` to switch to another free model.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text(v_empty(), parse_mode=ParseMode.MARKDOWN)
 
 
 async def on_shutdown(app: Application):
@@ -586,6 +680,7 @@ def main():
     app.add_handler(CommandHandler("models", models_command))
     app.add_handler(CommandHandler("clearfile", clear_file))
     app.add_handler(CommandHandler("behaviors", behaviors_command))
+    app.add_handler(CommandHandler("debug", debug_command))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
