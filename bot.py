@@ -1,5 +1,6 @@
 import logging
 import time
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -27,8 +28,18 @@ user_files: dict[int, dict] = {}  # {uid: {"name": str, "content": str}}
 _models_cache: dict = {"data": [], "ts": 0.0}
 CACHE_TTL = 300
 
+CODE_EXTS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h", ".hpp",
+    ".go", ".rs", ".rb", ".php", ".sh", ".bash", ".zsh", ".fish",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".json", ".xml", ".html",
+    ".css", ".scss", ".sql", ".md", ".txt", ".log", ".env", ".gitignore",
+    ".csv", ".tsv", ".bat", ".ps1", ".vue", ".svelte", ".r", ".lua",
+    ".pl", ".kt", ".swift", ".dart", ".scala", ".clj", ".ex", ".exs",
+}
+
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_HISTORY = 20
+STREAM_TIMEOUT = 120  # seconds
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -82,9 +93,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/models — pick a free model\n"
         "/clearfile — remove attached file\n"
         "/status — health & current state\n"
-        "/init — AGENTS.md info\n"
         "/help — all commands\n\n"
-        "Send text as a prompt, or any text file to attach it."
+        "Send text as a prompt, or attach a code/text file."
     )
 
 
@@ -95,16 +105,13 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/new — fresh conversation\n"
         "/compact — compress context\n"
         "/clear — alias for /new\n"
-        "/undo — remove last exchange\n"
-        "/redo — not supported via proxy\n\n"
+        "/undo — remove last exchange\n\n"
         "*Model*\n"
         "/models — browse free Zen models\n"
         "/status — health & current state\n\n"
         "*Files*\n"
-        "Send any text file to attach it\n"
+        "Send a code/text file to attach it\n"
         "/clearfile — remove current attachment\n\n"
-        "*Project*\n"
-        "/init — AGENTS.md info\n\n"
         "Send any text as a prompt.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -199,7 +206,7 @@ async def clear_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No file attached.")
 
 
-# ── File handler (any text-decodable file) ────────────────────────
+# ── File handler ──────────────────────────────────────────────────
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -208,6 +215,16 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     fname = doc.file_name or "unnamed"
+    ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+
+    # Extension filter restored
+    if ext not in CODE_EXTS:
+        await update.message.reply_text(
+            f"Unsupported file type: `{ext}`\n"
+            f"Supported: common text and code files.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE:
         await update.message.reply_text("File too large (Telegram limit: 20MB).")
@@ -220,7 +237,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Download failed: {e}")
         return
 
-    # Try UTF-8, then latin-1. If both fail, it's a binary file.
     content = None
     for enc in ("utf-8", "latin-1"):
         try:
@@ -231,7 +247,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if content is None:
         await update.message.reply_text(
-            f"`{fname}` looks like a binary file and can't be read as text.",
+            f"`{fname}` can't be read as text (binary encoding).",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -251,7 +267,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ── Message handler (Qwen10-style rendering) ──────────────────────
+# ── Message handler ───────────────────────────────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -280,6 +296,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     thinking_text = ""
     answer_text = ""
     last_edit = 0.0
+    got_anything = False
 
     def render() -> str:
         parts = []
@@ -293,41 +310,53 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return "\n\n".join(parts)[:4000]
 
     try:
-        async for chunk in client.stream_chat(history, model):
-            choice = chunk.get("choices", [{}])[0]
-            delta = choice.get("delta", {})
+        # Wrap the stream in a timeout so it can't hang forever
+        async def _stream():
+            nonlocal thinking_text, answer_text, last_edit, got_anything
+            async for chunk in client.stream_chat(history, model):
+                choice = chunk.get("choices", [{}])[0]
+                delta = choice.get("delta", {})
 
-            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-            if reasoning:
-                thinking_text += reasoning
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if reasoning:
+                    thinking_text += reasoning
+                    got_anything = True
 
-            content = delta.get("content")
-            if content:
-                if "<think>" in content or "</think>" in content:
-                    cleaned = content.replace("<think>", "").replace("</think>", "")
-                    thinking_text += cleaned
-                else:
-                    answer_text += content
+                content = delta.get("content")
+                if content:
+                    got_anything = True
+                    if "<think>" in content or "</think>" in content:
+                        cleaned = content.replace("<think>", "").replace("</think>", "")
+                        thinking_text += cleaned
+                    else:
+                        answer_text += content
 
-            finish = choice.get("finish_reason")
-            if finish:
-                break
+                if choice.get("finish_reason"):
+                    break
 
-            now = time.time()
-            if now - last_edit > 1.2:
-                body = render()
-                if body:
-                    try:
-                        await msg.edit_text(body, parse_mode=ParseMode.HTML)
-                        last_edit = now
-                    except Exception:
-                        pass
+                now = time.time()
+                if now - last_edit > 1.2:
+                    body = render()
+                    if body:
+                        try:
+                            await msg.edit_text(body, parse_mode=ParseMode.HTML)
+                            last_edit = now
+                        except Exception:
+                            pass
+
+        await asyncio.wait_for(_stream(), timeout=STREAM_TIMEOUT)
+
+    except asyncio.TimeoutError:
+        await msg.edit_text(
+            f"❌ Timed out after {STREAM_TIMEOUT}s. Check the Zen proxy is running."
+        )
+        return
     except Exception as e:
         log.exception("stream error")
         await msg.edit_text(f"❌ Error: {e}")
         return
 
-    if answer_text or thinking_text:
+    if got_anything:
         history.append({"role": "assistant", "content": answer_text or thinking_text})
         body = render()
         for i in range(0, len(body), 4000):
@@ -340,7 +369,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(chunk)
     else:
-        await msg.edit_text("(no response)")
+        await msg.edit_text("(no response — model returned empty)")
 
 
 async def on_shutdown(app: Application):
