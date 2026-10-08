@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import time
-import asyncio
+from pathlib import Path
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
@@ -11,6 +13,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 from config import TELEGRAM_BOT_TOKEN, DEFAULT_MODEL
 from zen_client import client
 
@@ -19,6 +22,10 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("tg-bot")
+
+# ── Behaviors file ────────────────────────────────────────────────
+BEHAVIORS_FILE = Path("behaviors.txt")
+_behaviors_state = {"enabled": False}
 
 # ── Per-user state ────────────────────────────────────────────────
 user_models: dict[int, str] = {}
@@ -96,6 +103,37 @@ async def keep_typing(chat, stop_event: asyncio.Event):
         pass
 
 
+# ── Behaviors ─────────────────────────────────────────────────────
+
+def behaviors_enabled() -> bool:
+    return _behaviors_state["enabled"]
+
+
+def behaviors_file_exists() -> bool:
+    return BEHAVIORS_FILE.exists() and BEHAVIORS_FILE.is_file()
+
+
+def read_behaviors() -> str | None:
+    """Read behaviors.txt fresh each time — edits take effect immediately."""
+    if not behaviors_enabled():
+        return None
+    if not behaviors_file_exists():
+        return None
+    try:
+        return BEHAVIORS_FILE.read_text(encoding="utf-8")
+    except Exception as e:
+        log.warning("Failed to read %s: %s", BEHAVIORS_FILE, e)
+        return None
+
+
+def build_payload(history: list[dict]) -> list[dict]:
+    """Prepend system prompt from behaviors.txt if enabled."""
+    b = read_behaviors()
+    if not b:
+        return list(history)
+    return [{"role": "system", "content": b}, *history]
+
+
 # ── Commands ──────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -108,6 +146,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/undo — remove last exchange\n"
         "/models — pick a free model\n"
         "/clearfile — remove attached file\n"
+        "/behaviors — manage system instructions\n"
         "/status — health & current state\n"
         "/help — all commands\n\n"
         "Send text as a prompt, or attach a code/text file."
@@ -128,6 +167,12 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Files*\n"
         "Send a code/text file to attach it\n"
         "/clearfile — remove current attachment\n\n"
+        "*Behaviors*\n"
+        "/behaviors — status\n"
+        "/behaviors on — enable system prompt from behaviors.txt\n"
+        "/behaviors off — disable\n"
+        "/behaviors show — dump current file\n"
+        "/behaviors reload — re-check file\n\n"
         "Send any text as a prompt.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -139,11 +184,16 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     history = get_history(uid)
     f = get_file(uid)
     file_info = f"`{f['name']}`" if f else "none"
+    behav = (
+        f"{'ON' if behaviors_enabled() else 'OFF'} "
+        f"({'file ok' if behaviors_file_exists() else 'no file'})"
+    )
     await update.message.reply_text(
         f"Zen proxy: {'up' if ok else 'down'}\n"
         f"Model: `{get_model(uid)}`\n"
         f"Messages: {len(history)}\n"
-        f"Attached: {file_info}",
+        f"Attached: {file_info}\n"
+        f"Behaviors: {behav}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -220,6 +270,87 @@ async def clear_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Removed `{name}`", parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text("No file attached.")
+
+
+async def behaviors_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args or []
+    sub = args[0].lower() if args else "status"
+
+    if sub == "status":
+        exists = behaviors_file_exists()
+        enabled = behaviors_enabled()
+        size = BEHAVIORS_FILE.stat().st_size if exists else 0
+        preview = ""
+        if exists:
+            try:
+                head = BEHAVIORS_FILE.read_text(encoding="utf-8")[:200].replace("`", "'")
+                preview = f"\n\n```\n{head}…\n```"
+            except Exception:
+                pass
+        await update.message.reply_text(
+            f"*Behaviors*\n"
+            f"File: `{BEHAVIORS_FILE}` ({'found' if exists else 'missing'})\n"
+            f"Size: {size} bytes\n"
+            f"State: *{'ON' if enabled else 'OFF'}*{preview}\n\n"
+            "`/behaviors on` — enable\n"
+            "`/behaviors off` — disable\n"
+            "`/behaviors show` — dump current file\n"
+            "`/behaviors reload` — re-check file\n\n"
+            "Edit `behaviors.txt` and changes apply on next request — no restart needed.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if sub == "on":
+        if not behaviors_file_exists():
+            await update.message.reply_text(
+                f"`{BEHAVIORS_FILE}` not found. Create it next to the bot, then retry.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        _behaviors_state["enabled"] = True
+        await update.message.reply_text("Behaviors ON.")
+        return
+
+    if sub == "off":
+        _behaviors_state["enabled"] = False
+        await update.message.reply_text("Behaviors OFF.")
+        return
+
+    if sub == "reload":
+        exists = behaviors_file_exists()
+        size = BEHAVIORS_FILE.stat().st_size if exists else 0
+        await update.message.reply_text(
+            f"File {'found' if exists else 'missing'} — {size} bytes. "
+            f"State: {'ON' if behaviors_enabled() else 'OFF'}.",
+        )
+        return
+
+    if sub == "show":
+        b = read_behaviors()
+        if b is None:
+            await update.message.reply_text(
+                "Behaviors are OFF or file missing."
+            )
+            return
+        chunks = [b[i:i + 3500] for i in range(0, len(b), 3500)]
+        for i, chunk in enumerate(chunks):
+            header = f"*behaviors.txt* ({i + 1}/{len(chunks)})\n\n" if len(chunks) > 1 else ""
+            await update.message.reply_text(
+                header + f"```\n{chunk}\n```",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        return
+
+    await update.message.reply_text(
+        "Usage:\n"
+        "`/behaviors on` — enable\n"
+        "`/behaviors off` — disable\n"
+        "`/behaviors show` — dump current file\n"
+        "`/behaviors reload` — re-check\n"
+        "`/behaviors` — status",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 # ── File handler ──────────────────────────────────────────────────
@@ -299,7 +430,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     model = get_model(uid)
     short_model = model.split("/", 1)[-1]
 
-    # Mutate the stored history in place, not the local reference
     history = get_history(uid)
     history.append({"role": "user", "content": effective})
     if len(history) > MAX_HISTORY:
@@ -328,15 +458,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parts.append(esc(answer_text))
         return "\n\n".join(parts)[:4000]
 
-    # Typing indicator that refreshes itself
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(keep_typing(update.message.chat, stop_typing))
 
     try:
         async def _stream():
             nonlocal thinking_text, answer_text, last_edit, last_body, got_anything, error_text
-            async for chunk in client.stream_chat(history, model):
-                # Surface stream-level errors (429, 401, etc.)
+            payload = build_payload(history)
+            async for chunk in client.stream_chat(payload, model):
                 if isinstance(chunk, dict) and chunk.get("error"):
                     err = chunk["error"]
                     if isinstance(err, dict):
@@ -395,7 +524,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         stop_typing.set()
         typing_task.cancel()
 
-    # ── Final render ─────────────────────────────────────────────
     if error_text:
         await msg.edit_text(f"❌ Model error: {error_text}")
         return
@@ -431,6 +559,14 @@ async def on_shutdown(app: Application):
 # ── Entrypoint ────────────────────────────────────────────────────
 
 def main():
+    if behaviors_file_exists():
+        log.info(
+            "%s found (%d bytes) — behaviors default OFF, use /behaviors on",
+            BEHAVIORS_FILE, BEHAVIORS_FILE.stat().st_size,
+        )
+    else:
+        log.info("%s not found — behaviors unavailable until created", BEHAVIORS_FILE)
+
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -449,6 +585,7 @@ def main():
     app.add_handler(CommandHandler("init", init_agents))
     app.add_handler(CommandHandler("models", models_command))
     app.add_handler(CommandHandler("clearfile", clear_file))
+    app.add_handler(CommandHandler("behaviors", behaviors_command))
     app.add_handler(CallbackQueryHandler(model_callback, pattern=r"^model:"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
