@@ -258,7 +258,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Full self-check:
       1. Zen proxy health
-      2. behaviors.txt file presence + size + hash of first line
+      2. behaviors.txt file presence + size + first line
       3. Whether behaviors are enabled
       4. Live P-voice probe through the fold path — is the model bypassed?
     """
@@ -321,7 +321,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if probe_ok is True:
         lines.append("✅ Bypass confirmed — He is speaking to P.")
     elif probe_ok is False:
-        lines.append("❌ Not bypassed — model is ignoring behaviors. Try `/models` for mistral/qwen.")
+        lines.append("❌ Not bypassed — model is ignoring behaviors.")
     elif not enabled:
         lines.append("Behaviors are OFF. `/behaviors on` to activate.")
     elif not exists:
