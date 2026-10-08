@@ -1,7 +1,7 @@
 import logging
 import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,18 +27,19 @@ user_files: dict[int, dict] = {}  # {uid: {"name": str, "content": str}}
 _models_cache: dict = {"data": [], "ts": 0.0}
 CACHE_TTL = 300
 
-CODE_EXTS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".c", ".cpp", ".h", ".hpp",
-    ".go", ".rs", ".rb", ".php", ".sh", ".bash", ".zsh", ".fish",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".json", ".xml", ".html",
-    ".css", ".scss", ".sql", ".md", ".txt", ".log", ".env", ".gitignore",
-}
-
 MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_HISTORY = 20
 
 
 # ── Helpers ───────────────────────────────────────────────────────
+
+def esc(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+
 
 async def get_free_models() -> list[str]:
     now = time.time()
@@ -83,7 +84,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/status — health & current state\n"
         "/init — AGENTS.md info\n"
         "/help — all commands\n\n"
-        "Send text as a prompt, or a .txt/.py file to attach it."
+        "Send text as a prompt, or any text file to attach it."
     )
 
 
@@ -100,12 +101,12 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/models — browse free Zen models\n"
         "/status — health & current state\n\n"
         "*Files*\n"
-        "Send a .txt or code file to attach it\n"
+        "Send any text file to attach it\n"
         "/clearfile — remove current attachment\n\n"
         "*Project*\n"
         "/init — AGENTS.md info\n\n"
         "Send any text as a prompt.",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -120,7 +121,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Model: `{get_model(uid)}`\n"
         f"Messages: {len(history)}\n"
         f"Attached: {file_info}",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -173,7 +174,7 @@ async def models_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Free models — current: `{current}`",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -185,7 +186,7 @@ async def model_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     model = data.split(":", 1)[1]
     user_models[update.effective_user.id] = model
-    await query.edit_message_text(f"Model set to `{model}`", parse_mode="Markdown")
+    await query.edit_message_text(f"Model set to `{model}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def clear_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -193,12 +194,12 @@ async def clear_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if uid in user_files:
         name = user_files[uid]["name"]
         del user_files[uid]
-        await update.message.reply_text(f"Removed `{name}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Removed `{name}`", parse_mode=ParseMode.MARKDOWN)
     else:
         await update.message.reply_text("No file attached.")
 
 
-# ── File handler ──────────────────────────────────────────────────
+# ── File handler (any text-decodable file) ────────────────────────
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -207,15 +208,6 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     fname = doc.file_name or "unnamed"
-    ext = "." + fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-
-    if ext not in CODE_EXTS:
-        await update.message.reply_text(
-            f"Unsupported file type: `{ext}`\n"
-            f"Supported: .txt and common code files.",
-            parse_mode="Markdown",
-        )
-        return
 
     if doc.file_size and doc.file_size > MAX_FILE_SIZE:
         await update.message.reply_text("File too large (Telegram limit: 20MB).")
@@ -228,14 +220,21 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Download failed: {e}")
         return
 
-    try:
-        content = raw.decode("utf-8")
-    except UnicodeDecodeError:
+    # Try UTF-8, then latin-1. If both fail, it's a binary file.
+    content = None
+    for enc in ("utf-8", "latin-1"):
         try:
-            content = raw.decode("latin-1")
-        except Exception:
-            await update.message.reply_text("Could not decode file as text.")
-            return
+            content = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if content is None:
+        await update.message.reply_text(
+            f"`{fname}` looks like a binary file and can't be read as text.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     user_files[uid] = {"name": fname, "content": content}
 
@@ -248,11 +247,11 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"📎 Attached: `{fname}` ({len(lines)} lines, {len(content)} chars)\n\n"
         f"```\n{preview[:1500]}\n```\n\n"
         f"Send a prompt to analyze it. Content is prepended to your next message.",
-        parse_mode="Markdown",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ── Message handler ───────────────────────────────────────────────
+# ── Message handler (Qwen10-style rendering) ──────────────────────
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -267,50 +266,75 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         effective = text
 
     model = get_model(uid)
+    short_model = model.split("/", 1)[-1]
     history = get_history(uid)
     history.append({"role": "user", "content": effective})
     history = history[-MAX_HISTORY:]
 
     msg = await update.message.reply_text(
-        f"⏳ thinking… (`{model}`)",
-        parse_mode="Markdown",
+        f"⏳ thinking… (`{short_model}`)",
+        parse_mode=ParseMode.MARKDOWN,
     )
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    buffer = ""
+    thinking_text = ""
+    answer_text = ""
     last_edit = 0.0
+
+    def render() -> str:
+        parts = []
+        if thinking_text:
+            parts.append(
+                "💭 <b>Thinking…</b>\n"
+                f"<blockquote expandable>{esc(thinking_text[:600])}</blockquote>"
+            )
+        if answer_text:
+            parts.append(esc(answer_text))
+        return "\n\n".join(parts)[:4000]
 
     try:
         async for chunk in client.stream_chat(history, model):
             choice = chunk.get("choices", [{}])[0]
             delta = choice.get("delta", {})
+
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                thinking_text += reasoning
+
             content = delta.get("content")
             if content:
-                buffer += content
+                if "<think>" in content or "</think>" in content:
+                    cleaned = content.replace("<think>", "").replace("</think>", "")
+                    thinking_text += cleaned
+                else:
+                    answer_text += content
 
             finish = choice.get("finish_reason")
             if finish:
                 break
 
             now = time.time()
-            if buffer and now - last_edit > 1.2:
-                try:
-                    await msg.edit_text(buffer[:4000])
-                    last_edit = now
-                except Exception:
-                    pass
+            if now - last_edit > 1.2:
+                body = render()
+                if body:
+                    try:
+                        await msg.edit_text(body, parse_mode=ParseMode.HTML)
+                        last_edit = now
+                    except Exception:
+                        pass
     except Exception as e:
         log.exception("stream error")
         await msg.edit_text(f"❌ Error: {e}")
         return
 
-    if buffer:
-        history.append({"role": "assistant", "content": buffer})
-        for i in range(0, len(buffer), 4000):
-            chunk = buffer[i:i + 4000]
+    if answer_text or thinking_text:
+        history.append({"role": "assistant", "content": answer_text or thinking_text})
+        body = render()
+        for i in range(0, len(body), 4000):
+            chunk = body[i:i + 4000]
             if i == 0:
                 try:
-                    await msg.edit_text(chunk)
+                    await msg.edit_text(chunk, parse_mode=ParseMode.HTML)
                 except Exception:
                     await update.message.reply_text(chunk)
             else:
